@@ -1,0 +1,232 @@
+import { AptosClient, Types } from "aptos";
+import { DeFiPlugin } from "../types";
+
+interface PoolInfo {
+    address: string;
+    coinX: string;
+    coinY: string;
+    reserveX: string;
+    reserveY: string;
+    lpTotal: string;
+}
+
+interface SwapQuote {
+    outputAmount: string;
+    priceImpact: string;
+    minimumReceived: string;
+    fee: string;
+    route: string[];
+}
+
+export class LiquidityPoolPlugin implements DeFiPlugin {
+    private client: AptosClient;
+    private readonly PROTOCOLS = {
+        PANCAKE: "0x123...pancake", // Replace with actual PancakeSwap address
+        LIQUID_SWAP: "0x456...liquid", // Replace with actual LiquidSwap address
+    };
+
+    constructor(nodeUrl: string) {
+        this.client = new AptosClient(nodeUrl);
+    }
+
+    async execute(action: string, params: any): Promise<any> {
+        switch (action) {
+            case "getPoolInfo":
+                return this.getPoolInfo(params.poolAddress);
+            case "calculateSwap":
+                return this.calculateSwap(
+                    params.dex,
+                    params.fromToken,
+                    params.toToken,
+                    params.amount
+                );
+            case "getLiquidity":
+                return this.getLiquidity(params.poolAddress);
+            case "getAPR":
+                return this.getPoolAPR(params.poolAddress);
+            default:
+                throw new Error(`Unknown action: ${action}`);
+        }
+    }
+
+    private async getPoolInfo(poolAddress: string): Promise<PoolInfo> {
+        try {
+            const resources = await this.client.getAccountResources(poolAddress);
+            const poolResource = resources.find(r => 
+                r.type.includes("LiquidityPool") || 
+                r.type.includes("LPPool")
+            );
+
+            if (!poolResource) {
+                throw new Error("Pool not found");
+            }
+
+            const data = poolResource.data as any;
+            return {
+                address: poolAddress,
+                coinX: data.coin_x_info.name,
+                coinY: data.coin_y_info.name,
+                reserveX: data.coin_x_reserve,
+                reserveY: data.coin_y_reserve,
+                lpTotal: data.lp_supply
+            };
+        } catch (error) {
+            throw new Error(`Failed to get pool info: ${error.message}`);
+        }
+    }
+
+    private async calculateSwap(
+        dex: string,
+        fromToken: string,
+        toToken: string,
+        amount: string
+    ): Promise<SwapQuote> {
+        try {
+            // Get pool address for token pair
+            const poolAddress = await this.findPoolAddress(dex, fromToken, toToken);
+            
+            // Get current reserves
+            const poolInfo = await this.getPoolInfo(poolAddress);
+            
+            // Calculate output amount using constant product formula
+            // (x + Δx)(y - Δy) = xy
+            const inputAmount = BigInt(amount);
+            const reserveIn = BigInt(poolInfo.reserveX);
+            const reserveOut = BigInt(reserveY);
+            
+            // Calculate output with 0.3% fee
+            const amountWithFee = inputAmount * BigInt(997);
+            const numerator = amountWithFee * reserveOut;
+            const denominator = (reserveIn * BigInt(1000)) + amountWithFee;
+            const outputAmount = numerator / denominator;
+
+            // Calculate price impact
+            const priceImpact = this.calculatePriceImpact(
+                inputAmount,
+                outputAmount,
+                reserveIn,
+                reserveOut
+            );
+
+            return {
+                outputAmount: outputAmount.toString(),
+                priceImpact: priceImpact.toFixed(4),
+                minimumReceived: (outputAmount * BigInt(99) / BigInt(100)).toString(), // 1% slippage
+                fee: (inputAmount * BigInt(3) / BigInt(1000)).toString(),
+                route: [fromToken, toToken]
+            };
+        } catch (error) {
+            throw new Error(`Failed to calculate swap: ${error.message}`);
+        }
+    }
+
+    private async getLiquidity(poolAddress: string): Promise<{
+        totalLiquidity: string;
+        userLiquidity: string;
+    }> {
+        const poolInfo = await this.getPoolInfo(poolAddress);
+        return {
+            totalLiquidity: poolInfo.lpTotal,
+            userLiquidity: "0" // Would need user address to get specific liquidity
+        };
+    }
+
+    private async getPoolAPR(poolAddress: string): Promise<{
+        swapAPR: string;
+        rewardAPR: string;
+        totalAPR: string;
+    }> {
+        try {
+            // Fetch historical volume data
+            const volumeData = await this.getHistoricalVolume(poolAddress);
+            
+            // Calculate APR based on volume and fees
+            const dailyVolume = volumeData.reduce((sum, day) => sum + BigInt(day.volume), BigInt(0)) / BigInt(7);
+            const dailyFees = dailyVolume * BigInt(3) / BigInt(1000); // 0.3% fee
+            
+            // Annualize fees
+            const yearlyFees = dailyFees * BigInt(365);
+            
+            // Get pool TVL
+            const poolInfo = await this.getPoolInfo(poolAddress);
+            const tvl = BigInt(poolInfo.reserveX) + BigInt(poolInfo.reserveY);
+            
+            // Calculate APR
+            const swapAPR = (yearlyFees * BigInt(100)) / tvl;
+            
+            return {
+                swapAPR: swapAPR.toString(),
+                rewardAPR: "0", // Would need additional info about reward tokens
+                totalAPR: swapAPR.toString()
+            };
+        } catch (error) {
+            throw new Error(`Failed to get pool APR: ${error.message}`);
+        }
+    }
+
+    private async findPoolAddress(
+        dex: string,
+        tokenA: string,
+        tokenB: string
+    ): Promise<string> {
+        // Implementation would vary by DEX
+        // This is a simplified example
+        const dexAddress = this.PROTOCOLS[dex.toUpperCase()];
+        if (!dexAddress) {
+            throw new Error(`Unsupported DEX: ${dex}`);
+        }
+
+        const resources = await this.client.getAccountResources(dexAddress);
+        const factoryResource = resources.find(r => r.type.includes("Factory"));
+        
+        if (!factoryResource) {
+            throw new Error("Factory resource not found");
+        }
+
+        // In reality, we would need to query the factory to find the pool
+        // This is just a placeholder
+        return `${dexAddress}_${tokenA}_${tokenB}`;
+    }
+
+    private calculatePriceImpact(
+        inputAmount: bigint,
+        outputAmount: bigint,
+        reserveIn: bigint,
+        reserveOut: bigint
+    ): number {
+        const exactPrice = Number(reserveOut) / Number(reserveIn);
+        const executionPrice = Number(outputAmount) / Number(inputAmount);
+        const priceImpact = Math.abs((exactPrice - executionPrice) / exactPrice * 100);
+        return priceImpact;
+    }
+
+    private async getHistoricalVolume(poolAddress: string): Promise<Array<{
+        date: string;
+        volume: string;
+    }>> {
+        // In a real implementation, this would query historical data
+        // This is just a placeholder
+        return Array(7).fill(null).map((_, i) => ({
+            date: new Date(Date.now() - i * 24 * 60 * 60 * 1000).toISOString(),
+            volume: "1000000000" // Example volume
+        }));
+    }
+}
+
+// Example usage:
+/*
+const plugin = new LiquidityPoolPlugin("https://fullnode.mainnet.aptoslabs.com");
+
+// Get pool info
+const poolInfo = await plugin.execute("getPoolInfo", {
+    poolAddress: "0x123...abc"
+});
+
+// Calculate swap
+const swapQuote = await plugin.execute("calculateSwap", {
+    dex: "pancake",
+    fromToken: "0x1::aptos_coin::AptosCoin",
+    toToken: "0x...::USDC::USDC",
+    amount: "1000000000" // 10 APT
+});
+*/
